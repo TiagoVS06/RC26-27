@@ -11,6 +11,102 @@
 // MISC
 #define _POSIX_SOURCE 1 // POSIX compliant source
 #define BUF_SIZE 256
+#define FRAME_SIZE 5
+
+//BYTES
+#define FLAG 0x7E
+#define A_TX 0x03
+#define A_RX 0x01
+#define C_SET 0x03
+#define C_UA 0x07  
+
+//estados leitura frame
+
+typedef enum
+{
+    START,
+    FLAG_RCV,
+    A_RCV,
+    C_RCV,
+    BCC_OK,
+    STOP
+} State_Machine;
+
+//FUNÇÕES AUXILIARES
+
+//criar frame
+void buildFrame(const unsigned char *buf, unsigned char adress, unsigned char control){
+
+    buf[0] = FLAG;
+    buf[1] = adress;
+    buf[2] = control;
+    buf[3] = adress^control;
+    buf[4] = FLAG;
+
+}
+
+//ler frame
+int readFrame(unsigned char *buf){
+    unsigned char byte;
+    State_Machine state = START;
+
+    while(state != STOP){
+        int read = readByteSerialPort(&byte);
+        if(read < 0){
+            perror("Could not read byte from serial port");
+            return -1;
+        }
+        if (read == 0){
+            continue; // No byte read, continue to next iteration
+        }
+        switch(state){
+            case START:
+                if(byte == FLAG){
+                    buf[0] = byte;
+                    state = FLAG_RCV;
+                }
+                break;
+            case FLAG_RCV:
+                if(byte == A_TX || byte == A_RX){
+                    buf[1] = byte;
+                    state = A_RCV;
+                }else if(byte != FLAG){
+                    state = START;
+                }
+                break;
+            case A_RCV:
+                if(byte == C_SET || byte == C_UA){
+                    buf[2] = byte;
+                    state = C_RCV;
+                }else if(byte == FLAG){
+                    state = FLAG_RCV;
+                }else{
+                    state = START;
+                }
+                break;
+            case C_RCV:
+                if(byte == (buf[1]^buf[2])){
+                    buf[3] = byte;
+                    state = BCC_OK;
+                }else if(byte == FLAG){
+                    state = FLAG_RCV;
+                }else{
+                    state = START;
+                }
+                break;
+            case BCC_OK:
+                if(byte == FLAG){
+                    buf[4] = byte;
+                    state = STOP;
+                }else{
+                    state = START;
+                }
+                break;
+            default:
+                break;
+        }
+    }
+}
 
 ////////////////////////////////////////////////
 // LLOPEN
@@ -31,17 +127,14 @@ int llOpenTx(LinkLayer llParameters)
     printf("Serial port %s opened\n", llParameters.serialPort);
 
     // Create string to send
-    unsigned char buf[5] = {0};
+    unsigned char buf[FRAME_SIZE] = {0};
 
-    buf[0] = 0x7E;
-    buf[1] = 0x03;
-    buf[2] = 0x03;
-    buf[3] = buf[1]^buf[2];
-    buf[4] = 0x7E;
+    buildFrame(buf, A_TX, C_SET);
 
 
-    int bytes = writeBytesSerialPort(buf, 5);
+    int bytes = writeBytesSerialPort(buf, FRAME_SIZE);
     printf("%d bytes written to serial port\n", bytes);
+    printf("Sent SET frame: \n");
 
 
     // Wait for UA
@@ -126,13 +219,9 @@ int llOpenRx(LinkLayer llParameters)
 
     printf("Total bytes received: %d\n", nBytesBuf);
 
-    unsigned char buf[5] = {0};
+    unsigned char buf[FRAME_SIZE] = {0};
 
-    buf[0] = 0x7E;
-    buf[1] = 0x03;
-    buf[2] = 0x07;
-    buf[3] = buf[1]^buf[2];
-    buf[4] = 0x7E;
+    buildFrame(buf, A_RX, C_UA);
 
     int bytes = writeBytesSerialPort(buf, 5);
     printf("%d bytes written to serial port\n", bytes);
