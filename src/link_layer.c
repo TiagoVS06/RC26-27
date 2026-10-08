@@ -4,6 +4,7 @@
 
 #include "link_layer.h"
 #include "serial_port.h"
+#include "alarm_sigaction.h"
 
 #include <stdio.h>
 #include <unistd.h>
@@ -109,6 +110,25 @@ int readFrame(unsigned char *buf){
     return 0;
 }
 
+int alarmEnabled = FALSE;
+int alarmCount = 0;
+
+int alarmConfig(){
+    struct sigaction act = {0};
+
+    act.sa_handler = &alarmHandler;
+
+    if (sigaction(SIGALRM, &act, NULL) == -1){
+        perror("sigaction");
+        exit(1);
+    }
+
+    printf("Alarm configured\n");
+
+    return 0;
+}
+
+
 ////////////////////////////////////////////////
 // LLOPEN
 ////////////////////////////////////////////////
@@ -127,22 +147,42 @@ int llOpenTx(LinkLayer llParameters)
 
     printf("Serial port %s opened\n", llParameters.serialPort);
 
+    if (alarmConfig() < 0) return -1;
+
     // Create string to send
     unsigned char buf[FRAME_SIZE] = {0};
 
+
+    for (int i = 0; i < 4; i++){
+    // Enviar SET
     buildFrame(buf, A_TX, C_SET);
+    writeBytesSerialPort(buf, FRAME_SIZE);
 
+    printf("SET sent. Attempt %d\n", i + 1);
 
-    int bytes = writeBytesSerialPort(buf, FRAME_SIZE);
-    printf("%d bytes written to serial port\n", bytes);
-    printf("Sent SET frame: \n");
+    // Ativar alarme
+    alarmEnabled = TRUE;
+    alarm(3);
 
+    // Esperar pela resposta
+    if (readFrame(buf) == 0)
+    {
+        // Recebeu uma frame antes do timeout
+        alarm(0); // cancela o alarme
 
-    // Wait for UA
-
-    if(readFrame(buf) == 0 && buf[1] == A_RX){
-         printf("Received 5 bytes. Connection established. \n");
+        if (buf[1] == A_RX && buf[2] == C_UA)
+        {
+            printf("UA received. Connection established.\n");
+            return 0;
+        }
     }
+
+    // Se chegou aqui, não recebeu UA corretamente
+    if (!alarmEnabled)
+    {
+        printf("Timeout. Retrying...\n");
+    }
+}
 
 
     // Close serial port
@@ -180,10 +220,10 @@ int llOpenRx(LinkLayer llParameters)
     //ler o frame enviado por tx
 
     if(readFrame(buf) == 0 && buf[1] == A_TX){
-        printf("SET received.");
+        printf("SET received.\n");
 
         buildFrame(buf, A_RX, C_UA);
-        int bytes = writeBytesSerialPort(buf, BUF_SIZE);
+        int bytes = writeBytesSerialPort(buf, FRAME_SIZE);
         printf("%d bytes written to serial port\n", bytes);
     }
 
