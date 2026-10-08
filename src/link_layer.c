@@ -110,8 +110,8 @@ int readFrame(unsigned char *buf){
     return 0;
 }
 
-int alarmEnabled = FALSE;
-int alarmCount = 0;
+volatile int alarmEnabled = FALSE;
+volatile int alarmCount = 0;
 
 int alarmConfig(){
     struct sigaction act = {0};
@@ -167,14 +167,15 @@ int llOpenTx(LinkLayer llParameters)
     // Esperar pela resposta
     if (readFrame(buf) == 0)
     {
-        // Recebeu uma frame antes do timeout
-        alarm(0); // cancela o alarme
+        if (buf[1] == A_RX && buf[2] == C_UA){
 
-        if (buf[1] == A_RX && buf[2] == C_UA)
-        {
+            alarm(0);
+            alarmEnabled = FALSE;
+
             printf("UA received. Connection established.\n");
             return 0;
         }
+        printf("Received frame is not UA.\n");
     }
 
     // Se chegou aqui, não recebeu UA corretamente
@@ -184,6 +185,7 @@ int llOpenTx(LinkLayer llParameters)
     }
 }
 
+    printf("Failed to establish connection after 4 attempts.\n");
 
     // Close serial port
     if (closeSerialPort() < 0)
@@ -194,7 +196,7 @@ int llOpenTx(LinkLayer llParameters)
 
     printf("Serial port %s closed\n", llParameters.serialPort);
 
-    return 0;
+    return -1; // Failed to establish connection after 4 attempts
 }
 
 int llOpenRx(LinkLayer llParameters)

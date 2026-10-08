@@ -12,8 +12,8 @@
 #define FALSE 0
 #define TRUE 1
 
-int alarmEnabled = FALSE;
-int alarmCount = 0;
+extern volatile int alarmEnabled;
+extern volatile int alarmCount;
 
 // Alarm function handler.
 // This function will run whenever the signal SIGALRM is received.
