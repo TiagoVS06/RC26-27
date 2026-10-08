@@ -35,7 +35,7 @@ typedef enum
 //FUNÇÕES AUXILIARES
 
 //criar frame
-void buildFrame(const unsigned char *buf, unsigned char adress, unsigned char control){
+void buildFrame(unsigned char *buf, unsigned char adress, unsigned char control){
 
     buf[0] = FLAG;
     buf[1] = adress;
@@ -106,6 +106,7 @@ int readFrame(unsigned char *buf){
                 break;
         }
     }
+    return 0;
 }
 
 ////////////////////////////////////////////////
@@ -138,29 +139,11 @@ int llOpenTx(LinkLayer llParameters)
 
 
     // Wait for UA
-    volatile int STOP = FALSE;
-    int nBytesBuf = 0;
 
-    while (STOP == FALSE)
-    {
-        // Read one byte from serial port.
-        // NOTE: You must check how many bytes were actually read by reading the return value.
-        // In this example, we assume that the byte is always read, which may not be true.
-        unsigned char byte;
-        int bytes = readByteSerialPort(&byte);
-        nBytesBuf += bytes;
-
-        printf("Byte received: 0x%02X\n", byte);
-
-
-        if (nBytesBuf == 5)
-        {
-            printf("Received 5 bytes. Connection established. \n");
-            STOP = TRUE;
-        }
+    if(readFrame(buf) == 0 && buf[1] == A_RX){
+         printf("Received 5 bytes. Connection established. \n");
     }
 
-    printf("Total bytes received: %d\n", nBytesBuf);
 
     // Close serial port
     if (closeSerialPort() < 0)
@@ -191,40 +174,18 @@ int llOpenRx(LinkLayer llParameters)
 
     // Read from serial port until checked full frame.
 
-    // NOTE: This while() cycle is a simple example showing how to read from the serial port.
-    // It must be changed in order to respect the specifications of the protocol indicated in the Lab guide.
-
-    // TODO: Save the received bytes in a buffer array and print it at the end of the program.
-    volatile int STOP = FALSE;
-    int nBytesBuf = 0;
-
-    while (STOP == FALSE)
-    {
-        // Read one byte from serial port.
-        // NOTE: You must check how many bytes were actually read by reading the return value.
-        // In this example, we assume that the byte is always read, which may not be true.
-        unsigned char byte;
-        int bytes = readByteSerialPort(&byte);
-        nBytesBuf += bytes;
-
-        printf("Byte received: 0x%02X\n", byte);
-
-
-        if (nBytesBuf == 5)
-        {
-            printf("Received 5 bytes. Sending UA. \n");
-            STOP = TRUE;
-        }
-    }
-
-    printf("Total bytes received: %d\n", nBytesBuf);
-
+    //criar o buf onde se vai escrever o frame
     unsigned char buf[FRAME_SIZE] = {0};
 
-    buildFrame(buf, A_RX, C_UA);
+    //ler o frame enviado por tx
 
-    int bytes = writeBytesSerialPort(buf, 5);
-    printf("%d bytes written to serial port\n", bytes);
+    if(readFrame(buf) == 0 && buf[1] == A_TX){
+        printf("SET received.");
+
+        buildFrame(buf, A_RX, C_UA);
+        int bytes = writeBytesSerialPort(buf, BUF_SIZE);
+        printf("%d bytes written to serial port\n", bytes);
+    }
 
     // Wait until all bytes have been written to the serial port
     sleep(1);
