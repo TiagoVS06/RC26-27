@@ -21,6 +21,8 @@
 #define C_SET 0x03
 #define C_UA 0x07  
 #define C_DISC 0x0B
+#define A_CMD_TX 0x03   // comandos do Tx / respostas do Rx
+#define A_CMD_RX 0x01   // comandos do Rx / respostas do Tx
 
 //estados leitura frame
 
@@ -74,7 +76,7 @@ int readFrame(unsigned char *buf, int useTimeout){
                 }
                 break;
             case FLAG_RCV:
-                if(byte == A_TX || byte == A_RX){
+                if(byte == A_CMD_TX || byte == A_CMD_RX){
                     buf[1] = byte;
                     state = A_RCV;
                 }else if(byte != FLAG){
@@ -173,7 +175,7 @@ int llOpenTx(LinkLayer llParameters)
     // Esperar pela resposta
     if (readFrame(buf, 1) == 0)
     {
-        if (buf[1] == A_RX && buf[2] == C_UA){
+        if (buf[1] == A_CMD_TX && buf[2] == C_UA){
 
             alarm(0);
             alarmEnabled = FALSE;
@@ -219,10 +221,10 @@ int llOpenRx(LinkLayer llParameters)
 
     //ler o frame enviado por tx
 
-    if(readFrame(buf, 0) == 0 && buf[1] == A_TX && buf[2] == C_SET){
+    if(readFrame(buf, 0) == 0 && buf[1] == A_CMD_TX && buf[2] == C_SET){
         printf("SET received.\n");
 
-        buildFrame(buf, A_RX, C_UA);
+        buildFrame(buf, A_CMD_TX, C_UA);
         int bytes = writeBytesSerialPort(buf, FRAME_SIZE);
         printf("%d bytes written to serial port\n", bytes);
         return 0;
@@ -273,14 +275,14 @@ int llCloseTx()
     // Esperar pela resposta
     if (readFrame(buf, 1) == 0)
     {
-        if (buf[1] == A_RX && buf[2] == C_DISC){
+        if (buf[1] == A_CMD_RX && buf[2] == C_DISC){
 
             alarm(0);
             alarmEnabled = FALSE;
 
             printf("DISC received from RX.\n");
 
-            buildFrame(buf, A_TX, C_UA);
+            buildFrame(buf, A_CMD_RX, C_UA);  
             
             writeBytesSerialPort(buf, FRAME_SIZE);
             
@@ -319,11 +321,11 @@ int llCloseRx()
 
     //ler o frame enviado por tx
 
-    if(readFrame(buf, 0) == 0 && buf[1] == A_TX && buf[2] == C_DISC){
+    if(readFrame(buf, 0) == 0 && buf[1] == A_CMD_TX && buf[2] == C_DISC){
         printf("DISC received from TX.\n");
 
 
-        buildFrame(buf, A_RX, C_DISC);
+        buildFrame(buf, A_CMD_RX, C_DISC);
         int bytes = writeBytesSerialPort(buf, FRAME_SIZE);
         printf("%d bytes written to serial port\n", bytes);
         printf("DISC sent.\n");
@@ -331,7 +333,7 @@ int llCloseRx()
         // Esperar pela resposta
         if (readFrame(buf, 0) == 0)
         {
-            if (buf[1] == A_TX && buf[2] == C_UA){
+            if(buf[1] == A_CMD_RX && buf[2] == C_UA){
 
                 printf("UA received from TX.\n");
             
