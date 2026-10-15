@@ -20,6 +20,7 @@
 #define A_RX 0x01
 #define C_SET 0x03
 #define C_UA 0x07  
+#define C_DISC 0x0B
 
 //estados leitura frame
 
@@ -47,11 +48,16 @@ void buildFrame(unsigned char *buf, unsigned char adress, unsigned char control)
 }
 
 //ler frame
-int readFrame(unsigned char *buf){
+int readFrame(unsigned char *buf, int useTimeout){
     unsigned char byte;
     State_Machine state = START;
 
     while(state != STOP){
+        //verificar se passaram 3 segundos
+        if (useTimeout && !alarmEnabled) {
+            return -1;
+        }
+
         int read = readByteSerialPort(&byte);
         if(read < 0){
             perror("Could not read byte from serial port");
@@ -76,7 +82,7 @@ int readFrame(unsigned char *buf){
                 }
                 break;
             case A_RCV:
-                if(byte == C_SET || byte == C_UA){
+                if(byte == C_SET || byte == C_UA || byte == C_DISC){
                     buf[2] = byte;
                     state = C_RCV;
                 }else if(byte == FLAG){
@@ -165,7 +171,7 @@ int llOpenTx(LinkLayer llParameters)
     alarm(3);
 
     // Esperar pela resposta
-    if (readFrame(buf) == 0)
+    if (readFrame(buf, 1) == 0)
     {
         if (buf[1] == A_RX && buf[2] == C_UA){
 
@@ -186,15 +192,7 @@ int llOpenTx(LinkLayer llParameters)
 }
 
     printf("Failed to establish connection after 4 attempts.\n");
-
-    // Close serial port
-    if (closeSerialPort() < 0)
-    {
-        perror("closeSerialPort");
-        return -1;
-    }
-
-    printf("Serial port %s closed\n", llParameters.serialPort);
+    closeSerialPort();
 
     return -1; // Failed to establish connection after 4 attempts
 }
@@ -221,27 +219,17 @@ int llOpenRx(LinkLayer llParameters)
 
     //ler o frame enviado por tx
 
-    if(readFrame(buf) == 0 && buf[1] == A_TX){
+    if(readFrame(buf, 0) == 0 && buf[1] == A_TX && buf[2] == C_SET){
         printf("SET received.\n");
 
         buildFrame(buf, A_RX, C_UA);
         int bytes = writeBytesSerialPort(buf, FRAME_SIZE);
         printf("%d bytes written to serial port\n", bytes);
+        return 0;
     }
 
-    // Wait until all bytes have been written to the serial port
-    sleep(1);
-
-    // Close serial port
-    if (closeSerialPort() < 0)
-    {
-        perror("closeSerialPort");
-        return -1;
-    }
-
-    printf("Serial port %s closed\n", llParameters.serialPort);
-
-    return 0;
+    closeSerialPort();
+    return -1;
 }
 
 ////////////////////////////////////////////////
@@ -269,14 +257,97 @@ int llReceive(unsigned char *packet)
 ////////////////////////////////////////////////
 int llCloseTx()
 {
-    // TODO: Implement this function
+    unsigned char buf[FRAME_SIZE] = {0};
 
-    return 0;
+    for (int i = 0; i < 4; i++){
+    // Enviar DISC
+    buildFrame(buf, A_TX, C_DISC);
+    writeBytesSerialPort(buf, FRAME_SIZE);
+
+    printf("DISC sent. Attempt %d\n", i + 1);
+
+    // Ativar alarme
+    alarmEnabled = TRUE;
+    alarm(3);
+
+    // Esperar pela resposta
+    if (readFrame(buf, 1) == 0)
+    {
+        if (buf[1] == A_RX && buf[2] == C_DISC){
+
+            alarm(0);
+            alarmEnabled = FALSE;
+
+            printf("DISC received from RX.\n");
+
+            buildFrame(buf, A_TX, C_UA);
+            
+            writeBytesSerialPort(buf, FRAME_SIZE);
+            
+            printf("UA sent.\n");
+
+            sleep(1);
+            
+            if (closeSerialPort() < 0) {
+        
+                perror("closeSerialPort");
+
+                return -1;
+            }
+
+            return 0;
+        }
+        printf("Received frame is not DISC.\n");
+    }
+
+    // Se chegou aqui, não recebeu DISC corretamente
+    if (!alarmEnabled)
+    {
+        printf("Timeout. Retrying...\n");
+    }
+}
+    printf("Failed to disconnect after 4 attempts.\n");
+    closeSerialPort();
+    return -1;
 }
 
 int llCloseRx()
 {
-    // TODO: Implement this function
+    // Read from serial port until checked full frame.
+    //criar o buf onde se vai escrever o frame
+    unsigned char buf[FRAME_SIZE] = {0};
 
-    return 0;
+    //ler o frame enviado por tx
+
+    if(readFrame(buf, 0) == 0 && buf[1] == A_TX && buf[2] == C_DISC){
+        printf("DISC received from TX.\n");
+
+
+        buildFrame(buf, A_RX, C_DISC);
+        int bytes = writeBytesSerialPort(buf, FRAME_SIZE);
+        printf("%d bytes written to serial port\n", bytes);
+        printf("DISC sent.\n");
+
+        // Esperar pela resposta
+        if (readFrame(buf, 0) == 0)
+        {
+            if (buf[1] == A_TX && buf[2] == C_UA){
+
+                printf("UA received from TX.\n");
+            
+                if (closeSerialPort() < 0) {
+        
+                    perror("closeSerialPort");
+
+                    return -1;
+                }
+
+                return 0;
+            }
+            printf("Received frame is not UA.\n");
+            }
+    }
+    printf("Failed to close connection.\n");
+    closeSerialPort();
+    return -1;
 }
