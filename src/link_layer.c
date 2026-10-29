@@ -1,4 +1,4 @@
-#define _POSIX_SOURCE 1 // POSIX compliant source
+#define _POSIX_C_SOURCE 199309L // para o clock_gettime
 // RCOM 2026/2027
 //
 // Link layer protocol implementation
@@ -7,14 +7,15 @@
 #include "serial_port.h"
 #include "alarm_sigaction.h"
 
+#include <errno.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 #include <unistd.h>
-#include <string.h> 
+#include <string.h>
 
 // MISC
-#define BUF_SIZE 256
 #define FRAME_SIZE 5
 
 #define MAX_FRAME_SIZE (2 * (MAX_PAYLOAD_SIZE + 1) + 5)
@@ -55,42 +56,45 @@ typedef enum
     STOP
 } State_Machine;
 
-// ESTATÍSTICAS DO PROTOCOLO
+// estatísticas
 typedef struct
 {
     // Tx
-    int iFramesSent;       // tramas I novas enviadas
-    int retransmissions;   // retransmissões (I, SET ou DISC)
-    int timeouts;          // nº de vezes que o temporizador expirou
-    int rejReceived;       // REJ recebidos
+    int iFramesSent;       // tramas I novas
+    int retransmissions;   // retransmissões (I, SET, DISC)
+    int timeouts;
+    int rejReceived;
     // Rx
-    int iFramesAccepted;   // tramas I novas aceites e entregues à aplicação
-    int duplicates;        // tramas I duplicadas recebidas
-    int rejSent;           // REJ enviados (erro no BCC2)
-    int headerErrors;      // tramas ignoradas por BCC1 errado
+    int iFramesAccepted;   // tramas I aceites
+    int duplicates;
+    int rejSent;
+    int headerErrors;      // BCC1 errado
+    // Tx e Rx
+    long bytes;            // bytes de dados (sem stuffing)
 } Statistics;
 
-static LinkLayer ll;                 // parâmetros guardados no llOpen (timeout, nRetransmissions)
-static unsigned char txNs = 0;       // Tx: número (0/1) da próxima trama I a enviar
-static unsigned char rxExpected = 0; // Rx: número (0/1) da trama I que espera receber
+static LinkLayer ll;                 // parâmetros do llOpen
+static unsigned char txNs = 0;       // Tx: Ns da próxima trama I
+static unsigned char rxExpected = 0; // Rx: Ns que espera receber
 static Statistics stats;
 static int isTx = 0;
+static struct timespec tStart, tEnd; // tempo da transferência
 
 volatile int alarmEnabled = FALSE;
 volatile int alarmCount = 0;
 //FUNÇÕES AUXILIARES
 
 //criar frame
-void buildFrame(unsigned char *buf, unsigned char adress, unsigned char control){
+void buildFrame(unsigned char *buf, unsigned char address, unsigned char control){
 
     buf[0] = FLAG;
-    buf[1] = adress;
+    buf[1] = address;
     buf[2] = control;
-    buf[3] = adress^control;
+    buf[3] = address^control;
     buf[4] = FLAG;
 
 }
-// construir e enviar trama S/U
+// enviar trama S/U
 static int sendSU(unsigned char address, unsigned char control)
 {
     unsigned char f[FRAME_SIZE];
@@ -98,14 +102,21 @@ static int sendSU(unsigned char address, unsigned char control)
     return writeBytesSerialPort(f, FRAME_SIZE);
 }
  
-// desligar o alarme (usado em todas as saídas das funções que o ativam)
+// desligar o alarme
 static void stopAlarm()
 {
     alarm(0);
     alarmEnabled = FALSE;
 }
 
-// BCC2 = XOR de todos os bytes de dados (calculado SEM stuffing)
+// timeout do Rx caso o Tx deixe de enviar (2x o tempo das tentativas do Tx)
+static int rxInactivityTimeout()
+{
+    int maxTxTime = (MAX_FRAME_SIZE * 10) / ll.baudRate + 1;
+    return 2 * (ll.nRetransmissions + 1) * (ll.timeout + maxTxTime);
+}
+
+// BCC2 = XOR dos dados (antes do stuffing)
 static unsigned char calcBCC2(const unsigned char *data, int n)
 {
     unsigned char bcc = 0;
@@ -114,8 +125,7 @@ static unsigned char calcBCC2(const unsigned char *data, int n)
     return bcc;
 }
 
-// Byte stuffing: 0x7E -> 0x7D 0x5E ; 0x7D -> 0x7D 0x5D.
-// Devolve o nº de bytes escritos em out (no máximo 2*n).
+// stuffing: 0x7E -> 7D 5E, 0x7D -> 7D 5D
 static int stuffBytes(const unsigned char *in, int n, unsigned char *out)
 {
     int j = 0;
@@ -134,8 +144,7 @@ static int stuffBytes(const unsigned char *in, int n, unsigned char *out)
     return j;
 }
 
-// Destuffing: 0x7D 0x5E -> 0x7E ; 0x7D 0x5D -> 0x7D.
-// Devolve o nº de bytes escritos em out, ou -1 se a sequência de escape for inválida.
+// destuffing, devolve -1 se o escape for inválido
 static int destuffBytes(const unsigned char *in, int n, unsigned char *out)
 {
     int j = 0;
@@ -160,7 +169,14 @@ static int destuffBytes(const unsigned char *in, int n, unsigned char *out)
 
 static void printStatistics()
 {
+    double time = (tEnd.tv_sec - tStart.tv_sec) + (tEnd.tv_nsec - tStart.tv_nsec) / 1e9;
+    double R = time > 0 ? stats.bytes * 8 / time : 0; // bit/s
+
     printf("\n---------- PROTOCOL STATISTICS ----------\n");
+    printf("Transfer time:              %.3f s\n", time);
+    printf("Data bytes:                 %ld\n", stats.bytes);
+    printf("R (bit/s):                  %.1f\n", R);
+    printf("S = R/C:                    %.4f\n", R / ll.baudRate);
     if (isTx)
     {
         printf("I frames sent (new):        %d\n", stats.iFramesSent);
@@ -186,18 +202,19 @@ int readFrame(unsigned char *buf, int useTimeout){
     State_Machine state = START;
 
     while(state != STOP){
-        //verificar se passaram 3 segundos
+        //timeout
         if (useTimeout && !alarmEnabled) {
             return -1;
         }
 
         int read = readByteSerialPort(&byte);
         if(read < 0){
-            perror("Could not read byte from serial port");
+            if (errno != EINTR) // EINTR = foi o alarme, não é erro
+                perror("Could not read byte from serial port");
             return -1;
         }
         if (read == 0){
-            continue; // No byte read, continue to next iteration
+            continue;
         }
         switch(state){
             case START:
@@ -249,22 +266,23 @@ int readFrame(unsigned char *buf, int useTimeout){
     return 0;
 }
 
-// Ler frame enviada pelo Tx durante a transferência (I, SET ou DISC).
-// Devolve o campo C do frama (ou -1 em erro).
-// Para tramas I, raw fica com os bytes ENTRE o BCC1 e a flag final (dados + BCC2, ainda com stuffing)
-// e *rawLen com o nº desses bytes. Para SET/DISC, *rawLen = 0.
+// ler trama do Tx (I, SET ou DISC), devolve o C ou -1
+// nas tramas I o raw fica com dados + BCC2 ainda com stuffing
 static int readTxFrame(unsigned char *raw, int *rawLen)
 {
+    static int lastWasFlag = 0; // a flag final da anterior pode ser a inicial desta
     unsigned char byte, a = 0, c = 0;
-    State_Machine state = START;
+    State_Machine state = lastWasFlag ? FLAG_RCV : START;
     int len = 0;
- 
+    lastWasFlag = 0;
+
     while (1)
     {
         int r = readByteSerialPort(&byte);
         if (r < 0)
         {
-            perror("Could not read byte from serial port");
+            if (errno != EINTR)
+                perror("Could not read byte from serial port");
             return -1;
         }
         if (r == 0)
@@ -308,13 +326,14 @@ static int readTxFrame(unsigned char *raw, int *rawLen)
             else
             {
                 stats.headerErrors++;
-                state = START; // BCC1 errado: ignorar a trama, sem resposta
+                state = START; // BCC1 errado, ignora
             }
             break;
         case BCC_OK: // SET ou DISC: só falta a flag
             if (byte == FLAG)
             {
                 *rawLen = 0;
+                lastWasFlag = 1;
                 return c;
             }
             state = START;
@@ -323,11 +342,12 @@ static int readTxFrame(unsigned char *raw, int *rawLen)
             if (byte == FLAG)
             {
                 *rawLen = len;
+                lastWasFlag = 1;
                 return c;
             }
             if (len >= MAX_FRAME_SIZE)
             {
-                state = START; // trama demasiado grande: descartar
+                state = START; // demasiado grande
                 break;
             }
             raw[len++] = byte;
@@ -356,9 +376,7 @@ int alarmConfig(){
 }
 
 
-////////////////////////////////////////////////
 // LLOPEN
-////////////////////////////////////////////////
 int llOpenTx(LinkLayer llParameters)
 {
 
@@ -382,7 +400,6 @@ int llOpenTx(LinkLayer llParameters)
         return -1;
     }
 
-    // Create string to send
     unsigned char buf[FRAME_SIZE] = {0};
 
 
@@ -397,20 +414,21 @@ int llOpenTx(LinkLayer llParameters)
        alarmEnabled = TRUE;
        alarm(ll.timeout);
 
-       // Esperar pela resposta
-     if (readFrame(buf, 1) == 0)
+       // Esperar pelo UA
+     while (readFrame(buf, 1) == 0)
      {
         if (buf[1] == A_CMD_TX && buf[2] == C_UA){
 
             stopAlarm();
 
             printf("UA received. Connection established.\n");
+            clock_gettime(CLOCK_MONOTONIC, &tStart);
             return 0;
         }
         printf("Received frame is not UA.\n");
     }
 
-    // Se chegou aqui, não recebeu UA corretamente
+    // não recebeu UA
     if (!alarmEnabled)
     {
         stats.timeouts++;
@@ -422,16 +440,11 @@ int llOpenTx(LinkLayer llParameters)
     printf("Failed to establish connection after all attempts.\n");
     closeSerialPort();
 
-    return -1; // Failed to establish connection after all attempts
+    return -1;
 }
 
 int llOpenRx(LinkLayer llParameters)
 {
-    // ----------------------------------------------------
-    // This example code shows how to open the serial port and receive a string.
-    // TODO: Adapt and extend this code according to the specifications of the project.
-    // ----------------------------------------------------
-
     ll = llParameters;
     isTx = 0;
     rxExpected = 0;
@@ -453,32 +466,32 @@ int llOpenRx(LinkLayer llParameters)
 
     
 
-    //criar o buf onde se vai escrever o frame
     unsigned char buf[FRAME_SIZE] = {0};
 
-    //ler o frame enviado por tx
+    //esperar pelo SET
 
-    if(readFrame(buf, 0) == 0 && buf[1] == A_CMD_TX && buf[2] == C_SET){
-        printf("SET received.\n");
+    while(readFrame(buf, 0) == 0){
+        if(buf[1] == A_CMD_TX && buf[2] == C_SET){
+            printf("SET received.\n");
 
-        int bytes = sendSU(A_CMD_TX, C_UA);
-        printf("%d bytes written to serial port\n", bytes);
-        return 0;
+            int bytes = sendSU(A_CMD_TX, C_UA);
+            printf("%d bytes written to serial port\n", bytes);
+            clock_gettime(CLOCK_MONOTONIC, &tStart);
+            return 0;
+        }
     }
 
     closeSerialPort();
     return -1;
 }
 
-////////////////////////////////////////////////
 // LLSEND
-////////////////////////////////////////////////
 int llSend(const unsigned char *buf, int bufSize)
 {
         if (buf == NULL || bufSize <= 0 || bufSize > MAX_PAYLOAD_SIZE)
         return -1;
  
-    // 1. Montar a trama I: F A C BCC1 | dados+BCC2 com stuffing | F
+    // trama I: F A C BCC1 dados BCC2 F (dados e BCC2 com stuffing)
     unsigned char frame[MAX_FRAME_SIZE];
     unsigned char bcc2 = calcBCC2(buf, bufSize); 
     int len = 0;
@@ -487,15 +500,20 @@ int llSend(const unsigned char *buf, int bufSize)
     frame[len++] = A_CMD_TX;
     frame[len++] = C_I(txNs);
     frame[len++] = A_CMD_TX ^ C_I(txNs);
-    len += stuffBytes(buf, bufSize, frame + len); // stuffing dos dados
+    len += stuffBytes(buf, bufSize, frame + len);
     len += stuffBytes(&bcc2, 1, frame + len);     
     frame[len++] = FLAG;
  
-    // 2. Enviar e esperar confirmação 
+    // tempo da trama a sair (10 bits por byte), soma-se ao timeout
+    int txTime = (len * 10) / ll.baudRate + 1;
+    int nSent = 0;
+
+    // enviar e esperar pelo RR
     for (int attempt = 0; attempt <= ll.nRetransmissions; attempt++)
     {
-        if (attempt == 0) stats.iFramesSent++;
+        if (nSent == 0) stats.iFramesSent++;
         else stats.retransmissions++;
+        nSent++;
 
         if (writeBytesSerialPort(frame, len) < 0){
             stopAlarm();
@@ -504,9 +522,8 @@ int llSend(const unsigned char *buf, int bufSize)
         printf("I(Ns=%d) sent (%d bytes). Attempt %d\n", txNs, len, attempt + 1);
  
         alarmEnabled = TRUE;
-        alarm(ll.timeout);
+        alarm(ll.timeout + txTime);
  
-        // Esperar até: RR certo (sucesso), REJ (reenviar já) ou timeout (reenviar)
         while (1)
         {
             unsigned char resp[FRAME_SIZE];
@@ -523,23 +540,24 @@ int llSend(const unsigned char *buf, int bufSize)
  
             if (resp[2] == C_RR(txNs ^ 1))
             {
-                // RR com o número da PRÓXIMA trama: a atual foi aceite
+                // RR(Ns+1): trama aceite
                 stopAlarm();
                 printf("RR%d received.\n", txNs ^ 1);
                 txNs ^= 1;
-                return len;
+                stats.bytes += bufSize;
+                return bufSize;
             }
  
             if (resp[2] == C_REJ(txNs))
             {
-                // REJ: retransmitir imediatamente, sem esperar pelo timeout
+                // REJ: reenvia logo
                 stopAlarm();
                 stats.rejReceived++;
                 printf("REJ%d received.\n", txNs);
+                attempt--; // REJ não conta como tentativa
                 break;
             }
  
-            // Outro frame,  ignorar e continuar à espera
         }
     }
  
@@ -551,9 +569,7 @@ int llSend(const unsigned char *buf, int bufSize)
     
 }
 
-////////////////////////////////////////////////
 // LLRECEIVE
-////////////////////////////////////////////////
 int llReceive(unsigned char *packet)
 {
     unsigned char raw[MAX_FRAME_SIZE];
@@ -562,13 +578,20 @@ int llReceive(unsigned char *packet)
  
     while (1)
     {
+        // para não ficar preso se o Tx desistir
+        alarmEnabled = TRUE;
+        alarm(rxInactivityTimeout());
         int c = readTxFrame(raw, &rawLen);
+        stopAlarm();
         if (c < 0)
+        {
+            printf("llReceive: no frame received from Tx (inactivity timeout).\n");
             return -1;
+        }
  
         if (c == C_SET)
         {
-            // O UA do llOpen perdeu-se e o Tx reenviou o SET: responder outra vez
+            // o UA perdeu-se, reenviar
             printf("SET received again. Resending UA.\n");
             sendSU(A_CMD_TX, C_UA);
             continue;
@@ -576,20 +599,19 @@ int llReceive(unsigned char *packet)
  
         if (c == C_DISC)
         {
-            // Não devia acontecer: a aplicação só chama llReceive até receber o END
             printf("DISC received during llReceive.\n");
             return -1;
         }
  
-        // frame I com header válido (o BCC1 já foi verificado na máquina de estados)
+        // trama I (BCC1 já verificado)
         int ns = (c == C_I1);
  
-        // 1. Destuffing PRIMEIRO, depois verificar BCC2
+        // destuffing e verificar BCC2
         int n = destuffBytes(raw, rawLen, data);
         int ok = n >= 2 && (n - 1) <= MAX_PAYLOAD_SIZE &&
                  calcBCC2(data, n - 1) == data[n - 1]; // último byte = BCC2
  
-        // 2. Duplicado (com ou sem erro nos dados): descartar e confirmar com RR
+        // duplicado: descartar e mandar RR
         if (ns != rxExpected)
         {
             stats.duplicates++;
@@ -598,7 +620,7 @@ int llReceive(unsigned char *packet)
             continue;
         }
  
-        // 3. Trama nova com erro nos dados: pedir retransmissão
+        // erro nos dados: REJ
         if (!ok)
         {
             stats.rejSent++;
@@ -607,11 +629,12 @@ int llReceive(unsigned char *packet)
             continue;
         }
  
-        // 4. Trama nova e correta: entregar à aplicação e confirmar
+        // trama nova e certa
         int packetSize = n - 1;
         memcpy(packet, data, packetSize);
         rxExpected ^= 1;
         stats.iFramesAccepted++;
+        stats.bytes += packetSize;
         sendSU(A_CMD_TX, C_RR(rxExpected));
         printf("I(Ns=%d) accepted (%d bytes). Sending RR%d.\n", ns, packetSize, rxExpected);
         return packetSize;
@@ -619,12 +642,12 @@ int llReceive(unsigned char *packet)
 
 }
 
-////////////////////////////////////////////////
 // LLCLOSE
-////////////////////////////////////////////////
 int llCloseTx()
 {
     unsigned char buf[FRAME_SIZE] = {0};
+
+    clock_gettime(CLOCK_MONOTONIC, &tEnd);
 
     for (int i = 0; i <= ll.nRetransmissions; i++){
     
@@ -639,8 +662,8 @@ int llCloseTx()
     alarmEnabled = TRUE;
     alarm(ll.timeout);
 
-    // Esperar pela resposta
-    if (readFrame(buf, 1) == 0)
+    // Esperar pelo DISC do Rx
+    while (readFrame(buf, 1) == 0)
     {
         if (buf[1] == A_CMD_RX && buf[2] == C_DISC){
 
@@ -668,7 +691,7 @@ int llCloseTx()
         printf("Received frame is not DISC.\n");
     }
 
-    // Se chegou aqui, não recebeu DISC corretamente
+    // não recebeu DISC
     if (!alarmEnabled)
     {
         stats.timeouts++;
@@ -688,13 +711,19 @@ int llCloseRx()
     unsigned char buf[FRAME_SIZE] = {0};
     int rawLen;
  
-    // 1. Esperar pelo DISC do Tx.
-    // Se o último RR se perdeu, o Tx ainda reenvia a última trama I: é um duplicado,
-    // por isso confirmamos outra vez com RR (sem isto, o Tx esgotava as tentativas).
+    // esperar pelo DISC (se o último RR se perdeu ainda pode vir a trama I repetida)
+    clock_gettime(CLOCK_MONOTONIC, &tEnd);
+
     while (1)
     {
+        // para não ficar preso se o Tx desistir
+        alarmEnabled = TRUE;
+        alarm(rxInactivityTimeout());
         int c = readTxFrame(raw, &rawLen);
+        stopAlarm();
         if (c < 0) {
+            printf("llCloseRx: DISC not received (inactivity timeout).\n");
+            printStatistics();
             closeSerialPort();
             return -1;
         }
@@ -712,7 +741,7 @@ int llCloseRx()
     }
     printf("DISC received from TX.\n");
  
-    // 2. Enviar DISC (comando do Rx -> protegido por temporizador) e esperar pelo UA
+    // enviar DISC e esperar pelo UA
     for (int i = 0; i <= ll.nRetransmissions; i++)
     {
         if (i > 0) stats.retransmissions++;
@@ -748,7 +777,7 @@ int llCloseRx()
  
             if (buf[1] == A_CMD_TX && buf[2] == C_DISC)
             {
-                // O Tx não recebeu o nosso DISC e reenviou o dele: reenviar já
+                // o Tx não recebeu o nosso DISC
                 stopAlarm();
                 printf("DISC received again from TX.\n");
                 break;
@@ -756,7 +785,7 @@ int llCloseRx()
         }
     }
  
-    // O UA final nunca chegou (provavelmente perdeu-se e o Tx já fechou)
+    // o UA não chegou
     stopAlarm();
     printf("Failed to close connection: UA not received.\n");
     printStatistics();

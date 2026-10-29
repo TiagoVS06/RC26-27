@@ -23,9 +23,8 @@
  
 #define MAX_NAME_SIZE 255 // L tem 1 byte -> V tem no máximo 255 bytes
  
-////////////////////////////////////////////////
+
 // FUNÇÕES AUXILIARES - PACOTES
-////////////////////////////////////////////////
  
 // Construir pacote de controlo (START ou END): C | T=0 L V(tamanho) | T=1 L V(nome)
 // Devolve o tamanho do pacote.
@@ -113,9 +112,8 @@ static int buildDataPacket(const unsigned char *data, int dataSize, unsigned cha
     return dataSize + DATA_HEADER_SIZE;
 }
  
-////////////////////////////////////////////////
 // TRANSMISSOR
-////////////////////////////////////////////////
+
 // Envia START, os pacotes de dados e END. Devolve 0 em sucesso, -1 em erro.
 static int sendFile(const char *filename)
 {
@@ -134,7 +132,7 @@ static int sendFile(const char *filename)
  
     unsigned char packet[MAX_PAYLOAD_SIZE];
  
-    // 1. START
+    // START
     int len = buildControlPacket(C_START, fileSize, filename, packet);
     if (llSend(packet, len) < 0)
     {
@@ -144,7 +142,7 @@ static int sendFile(const char *filename)
     }
     printf("START packet sent.\n");
  
-    // 2. Pacotes de dados até ao fim do ficheiro
+    // Pacotes de dados até ao fim do ficheiro
     unsigned char fragment[MAX_FRAGMENT_SIZE];
     long totalSent = 0;
     int nPackets = 0;
@@ -172,7 +170,7 @@ static int sendFile(const char *filename)
     }
     fclose(file);
  
-    // 3. END (repete a informação do START)
+    // END (repete a informação do START)
     len = buildControlPacket(C_END, fileSize, filename, packet);
     if (llSend(packet, len) < 0)
     {
@@ -184,11 +182,10 @@ static int sendFile(const char *filename)
     return 0;
 }
  
-////////////////////////////////////////////////
 // RECETOR
-////////////////////////////////////////////////
+
 // Recebe START, os pacotes de dados e END, e escreve o ficheiro em filename.
-// Devolve 0 em sucesso, -1 em erro.
+// 0 sucesso, -1 erro.
 static int receiveFile(const char *filename)
 {
     unsigned char packet[MAX_PAYLOAD_SIZE];
@@ -196,7 +193,7 @@ static int receiveFile(const char *filename)
     char fileName[MAX_NAME_SIZE + 1];
     int size;
  
-    // 1. Esperar pelo START
+    // Esperar o START
     while (1)
     {
         size = llReceive(packet);
@@ -217,7 +214,7 @@ static int receiveFile(const char *filename)
     }
     printf("START received: file \"%s\", %ld bytes\n", fileName, fileSize);
  
-    // Escrevemos no nome dado na linha de comandos (não no recebido), para não
+    // Escrevemos no nome dado na linha de comandos, para não
     // apagar o original quando Tx e Rx estão no mesmo PC.
     FILE *file = fopen(filename, "wb");
     if (file == NULL)
@@ -226,7 +223,7 @@ static int receiveFile(const char *filename)
         return -1;
     }
  
-    // 2. Pacotes de dados até ao END
+    //Pacotes de dados até ao END
     long totalReceived = 0;
     int nPackets = 0;
  
@@ -253,7 +250,7 @@ static int receiveFile(const char *filename)
             int k = 256 * packet[1] + packet[2]; // K = 256 * L2 + L1
             if (k != size - DATA_HEADER_SIZE)
             {
-                // verificação adicional de integridade permitida pelo campo L2 L1
+                // verificação adicional de integridade
                 printf("Data packet size mismatch (K=%d, received %d). Ignoring.\n", k, size - DATA_HEADER_SIZE);
                 continue;
             }
@@ -280,7 +277,7 @@ static int receiveFile(const char *filename)
  
     fclose(file);
  
-    // 3. Verificar o END e a integridade do ficheiro
+    // Verificar o END e a integridade do ficheiro
     long endSize = 0;
     char endName[MAX_NAME_SIZE + 1];
  
@@ -307,9 +304,9 @@ static int receiveFile(const char *filename)
     return 0;
 }
  
-////////////////////////////////////////////////
+
 // APPLICATION LAYER
-////////////////////////////////////////////////
+
 void applicationLayer(const char *serialPort, const char *role, int baudRate,
                       int nTries, int timeout, const char *filename)
 {
@@ -318,7 +315,8 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
         .nRetransmissions = nTries,
         .timeout = timeout,
     };
-    strcpy(llParameters.serialPort, serialPort);
+    // snprintf em vez de strcpy
+    snprintf(llParameters.serialPort, sizeof(llParameters.serialPort), "%s", serialPort);
  
     if (strcmp(role, "tx") == 0)
     {
@@ -331,7 +329,7 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
         if (sendFile(filename) < 0)
             printf("File transfer failed.\n");
  
-        // fechar sempre a ligação, mesmo que a transferência tenha falhado
+        // fechar sempre a ligação
         if (llCloseTx() < 0)
             printf("Failed to close connection (Tx).\n");
     }
@@ -344,7 +342,10 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
         }
  
         if (receiveFile(filename) < 0)
+        {
             printf("File reception failed.\n");
+            remove(filename); // não deixar um ficheiro incompleto
+        }
  
         if (llCloseRx() < 0)
             printf("Failed to close connection (Rx).\n");

@@ -10,12 +10,12 @@ Os valores marcados com **⚠ confirmar** devem ser verificados no guia do lab a
 | Função | Estado |
 |---|---|
 | `buildFrame` | ✅ Feito |
-| `readFrame` (tramas S/U, com `useTimeout`) | ✅ Feito (falta aceitar RR/REJ) |
+| `readFrame` (tramas S/U, com `useTimeout`) | ✅ Feito |
 | `llOpenTx` / `llOpenRx` | ✅ Feito |
 | `llCloseTx` / `llCloseRx` | ✅ Feito |
-| `llSend` | ⬜ Por fazer |
-| `llReceive` | ⬜ Por fazer |
-| Correções para a entrega | ⬜ Ver secção 8 |
+| `llSend` | ✅ Feito |
+| `llReceive` | ✅ Feito |
+| Correções para a entrega | ✅ Feito (ver protocolo/REVIEW.md) |
 
 ---
 
