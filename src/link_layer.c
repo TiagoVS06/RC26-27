@@ -1,3 +1,4 @@
+#define _POSIX_SOURCE 1 // POSIX compliant source
 // RCOM 2026/2027
 //
 // Link layer protocol implementation
@@ -6,12 +7,13 @@
 #include "serial_port.h"
 #include "alarm_sigaction.h"
 
+#include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <unistd.h>
 #include <string.h> 
 
 // MISC
-#define _POSIX_SOURCE 1 // POSIX compliant source
 #define BUF_SIZE 256
 #define FRAME_SIZE 5
 
@@ -53,6 +55,29 @@ typedef enum
     STOP
 } State_Machine;
 
+// ESTATÍSTICAS DO PROTOCOLO
+typedef struct
+{
+    // Tx
+    int iFramesSent;       // tramas I novas enviadas
+    int retransmissions;   // retransmissões (I, SET ou DISC)
+    int timeouts;          // nº de vezes que o temporizador expirou
+    int rejReceived;       // REJ recebidos
+    // Rx
+    int iFramesAccepted;   // tramas I novas aceites e entregues à aplicação
+    int duplicates;        // tramas I duplicadas recebidas
+    int rejSent;           // REJ enviados (erro no BCC2)
+    int headerErrors;      // tramas ignoradas por BCC1 errado
+} Statistics;
+
+static LinkLayer ll;                 // parâmetros guardados no llOpen (timeout, nRetransmissions)
+static unsigned char txNs = 0;       // Tx: número (0/1) da próxima trama I a enviar
+static unsigned char rxExpected = 0; // Rx: número (0/1) da trama I que espera receber
+static Statistics stats;
+static int isTx = 0;
+
+volatile int alarmEnabled = FALSE;
+volatile int alarmCount = 0;
 //FUNÇÕES AUXILIARES
 
 //criar frame
@@ -73,7 +98,12 @@ static int sendSU(unsigned char address, unsigned char control)
     return writeBytesSerialPort(f, FRAME_SIZE);
 }
  
-
+// desligar o alarme (usado em todas as saídas das funções que o ativam)
+static void stopAlarm()
+{
+    alarm(0);
+    alarmEnabled = FALSE;
+}
 
 // BCC2 = XOR de todos os bytes de dados (calculado SEM stuffing)
 static unsigned char calcBCC2(const unsigned char *data, int n)
@@ -128,6 +158,27 @@ static int destuffBytes(const unsigned char *in, int n, unsigned char *out)
     return j;
 }
 
+static void printStatistics()
+{
+    printf("\n---------- PROTOCOL STATISTICS ----------\n");
+    if (isTx)
+    {
+        printf("I frames sent (new):        %d\n", stats.iFramesSent);
+        printf("Retransmissions:            %d\n", stats.retransmissions);
+        printf("Timeouts:                   %d\n", stats.timeouts);
+        printf("REJ received:               %d\n", stats.rejReceived);
+    }
+    else
+    {
+        printf("I frames accepted:          %d\n", stats.iFramesAccepted);
+        printf("Duplicate I frames:         %d\n", stats.duplicates);
+        printf("REJ sent:                   %d\n", stats.rejSent);
+        printf("Frames with header error:   %d\n", stats.headerErrors);
+        printf("DISC retransmissions:       %d\n", stats.retransmissions);
+        printf("Timeouts:                   %d\n", stats.timeouts);
+    }
+    printf("-----------------------------------------\n\n");
+}
 
 //ler frame S/U
 int readFrame(unsigned char *buf, int useTimeout){
@@ -244,6 +295,7 @@ static int readTxFrame(unsigned char *raw, int *rawLen)
                 state = FLAG_RCV;
             else
                 state = START;
+            
             break;
         case C_RCV:
             if (byte == (a ^ c))
@@ -254,7 +306,10 @@ static int readTxFrame(unsigned char *raw, int *rawLen)
             else if (byte == FLAG)
                 state = FLAG_RCV;
             else
+            {
+                stats.headerErrors++;
                 state = START; // BCC1 errado: ignorar a trama, sem resposta
+            }
             break;
         case BCC_OK: // SET ou DISC: só falta a flag
             if (byte == FLAG)
@@ -284,12 +339,6 @@ static int readTxFrame(unsigned char *raw, int *rawLen)
 }
 
 
-static LinkLayer ll;                 // parâmetros guardados no llOpen (timeout, nRetransmissions)
-static unsigned char txNs = 0;       // Tx: número (0/1) da próxima trama I a enviar
-static unsigned char rxExpected = 0; // Rx: número (0/1) da trama I que espera receber
-
-volatile int alarmEnabled = FALSE;
-volatile int alarmCount = 0;
 
 int alarmConfig(){
     struct sigaction act = {0};
@@ -298,7 +347,7 @@ int alarmConfig(){
 
     if (sigaction(SIGALRM, &act, NULL) == -1){
         perror("sigaction");
-        exit(1);
+        return -1;
     }
 
     printf("Alarm configured\n");
@@ -314,13 +363,10 @@ int llOpenTx(LinkLayer llParameters)
 {
 
 
-    // ----------------------------------------------------
-    // This example code shows how to open the serial port and send a string.
-    // TODO: Adapt and extend this code according to the specifications of the project.
-    // ----------------------------------------------------
-
         ll = llParameters;
+        isTx = 1;
         txNs = 0;
+        memset(&stats, 0, sizeof(stats));
 
 
     if (openSerialPort(llParameters.serialPort, llParameters.baudRate) < 0)
@@ -331,29 +377,32 @@ int llOpenTx(LinkLayer llParameters)
 
     printf("Serial port %s opened\n", llParameters.serialPort);
 
-    if (alarmConfig() < 0) return -1;
+    if (alarmConfig() < 0) {
+        closeSerialPort();
+        return -1;
+    }
 
     // Create string to send
     unsigned char buf[FRAME_SIZE] = {0};
 
 
-    for (int i = 0; i < ll.nRetransmissions; i++){
-    // Enviar SET
-    sendSU(A_CMD_TX, C_SET);
+    for (int i = 0; i <= ll.nRetransmissions; i++){
+       if (i > 0) stats.retransmissions++;
+       // Enviar SET
+       sendSU(A_CMD_TX, C_SET);
 
-    printf("SET sent. Attempt %d\n", i + 1);
+       printf("SET sent. Attempt %d\n", i + 1);
 
-    // Ativar alarme
-    alarmEnabled = TRUE;
-    alarm(ll.timeout);
+       // Ativar alarme
+       alarmEnabled = TRUE;
+       alarm(ll.timeout);
 
-    // Esperar pela resposta
-    if (readFrame(buf, 1) == 0)
-    {
+       // Esperar pela resposta
+     if (readFrame(buf, 1) == 0)
+     {
         if (buf[1] == A_CMD_TX && buf[2] == C_UA){
 
-            alarm(0);
-            alarmEnabled = FALSE;
+            stopAlarm();
 
             printf("UA received. Connection established.\n");
             return 0;
@@ -364,11 +413,11 @@ int llOpenTx(LinkLayer llParameters)
     // Se chegou aqui, não recebeu UA corretamente
     if (!alarmEnabled)
     {
+        stats.timeouts++;
         printf("Timeout. Retrying...\n");
     }
 }
-    alarm(0);
-    alarmEnabled = FALSE;
+    stopAlarm();
 
     printf("Failed to establish connection after all attempts.\n");
     closeSerialPort();
@@ -384,7 +433,9 @@ int llOpenRx(LinkLayer llParameters)
     // ----------------------------------------------------
 
     ll = llParameters;
+    isTx = 0;
     rxExpected = 0;
+    memset(&stats, 0, sizeof(stats));
 
 
     if (openSerialPort(llParameters.serialPort, llParameters.baudRate) < 0)
@@ -395,7 +446,12 @@ int llOpenRx(LinkLayer llParameters)
 
     printf("Serial port %s opened\n", llParameters.serialPort);
 
-    // Read from serial port until checked full frame.
+    if (alarmConfig() < 0) {
+        closeSerialPort();
+        return -1;
+    }
+
+    
 
     //criar o buf onde se vai escrever o frame
     unsigned char buf[FRAME_SIZE] = {0};
@@ -438,8 +494,13 @@ int llSend(const unsigned char *buf, int bufSize)
     // 2. Enviar e esperar confirmação 
     for (int attempt = 0; attempt <= ll.nRetransmissions; attempt++)
     {
-        if (writeBytesSerialPort(frame, len) < 0)
+        if (attempt == 0) stats.iFramesSent++;
+        else stats.retransmissions++;
+
+        if (writeBytesSerialPort(frame, len) < 0){
+            stopAlarm();
             return -1;
+        }
         printf("I(Ns=%d) sent (%d bytes). Attempt %d\n", txNs, len, attempt + 1);
  
         alarmEnabled = TRUE;
@@ -452,6 +513,7 @@ int llSend(const unsigned char *buf, int bufSize)
  
             if (readFrame(resp, 1) < 0)
             {
+                stats.timeouts++;
                 printf("Timeout waiting for RR.\n");
                 break; // reenviar
             }
@@ -462,8 +524,7 @@ int llSend(const unsigned char *buf, int bufSize)
             if (resp[2] == C_RR(txNs ^ 1))
             {
                 // RR com o número da PRÓXIMA trama: a atual foi aceite
-                alarm(0);
-                alarmEnabled = FALSE;
+                stopAlarm();
                 printf("RR%d received.\n", txNs ^ 1);
                 txNs ^= 1;
                 return len;
@@ -472,8 +533,8 @@ int llSend(const unsigned char *buf, int bufSize)
             if (resp[2] == C_REJ(txNs))
             {
                 // REJ: retransmitir imediatamente, sem esperar pelo timeout
-                alarm(0);
-                alarmEnabled = FALSE;
+                stopAlarm();
+                stats.rejReceived++;
                 printf("REJ%d received.\n", txNs);
                 break;
             }
@@ -482,8 +543,7 @@ int llSend(const unsigned char *buf, int bufSize)
         }
     }
  
-    alarm(0);
-    alarmEnabled = FALSE;
+    stopAlarm();
     printf("llSend: max retransmissions reached.\n");
     return -1;
 
@@ -532,6 +592,7 @@ int llReceive(unsigned char *packet)
         // 2. Duplicado (com ou sem erro nos dados): descartar e confirmar com RR
         if (ns != rxExpected)
         {
+            stats.duplicates++;
             printf("Duplicate I(Ns=%d). Sending RR%d.\n", ns, rxExpected);
             sendSU(A_CMD_TX, C_RR(rxExpected));
             continue;
@@ -540,6 +601,7 @@ int llReceive(unsigned char *packet)
         // 3. Trama nova com erro nos dados: pedir retransmissão
         if (!ok)
         {
+            stats.rejSent++;
             printf("BCC2 error in I(Ns=%d). Sending REJ%d.\n", ns, ns);
             sendSU(A_CMD_TX, C_REJ(ns));
             continue;
@@ -549,6 +611,7 @@ int llReceive(unsigned char *packet)
         int packetSize = n - 1;
         memcpy(packet, data, packetSize);
         rxExpected ^= 1;
+        stats.iFramesAccepted++;
         sendSU(A_CMD_TX, C_RR(rxExpected));
         printf("I(Ns=%d) accepted (%d bytes). Sending RR%d.\n", ns, packetSize, rxExpected);
         return packetSize;
@@ -563,7 +626,10 @@ int llCloseTx()
 {
     unsigned char buf[FRAME_SIZE] = {0};
 
-    for (int i = 0; i < ll.nRetransmissions; i++){
+    for (int i = 0; i <= ll.nRetransmissions; i++){
+    
+    if (i > 0) stats.retransmissions++;
+
     // Enviar DISC
     sendSU(A_CMD_TX, C_DISC);
 
@@ -578,8 +644,7 @@ int llCloseTx()
     {
         if (buf[1] == A_CMD_RX && buf[2] == C_DISC){
 
-            alarm(0);
-            alarmEnabled = FALSE;
+            stopAlarm();
 
             printf("DISC received from RX.\n");
 
@@ -588,6 +653,8 @@ int llCloseTx()
             printf("UA sent.\n");
 
             sleep(1);
+
+            printStatistics();
             
             if (closeSerialPort() < 0) {
         
@@ -604,52 +671,95 @@ int llCloseTx()
     // Se chegou aqui, não recebeu DISC corretamente
     if (!alarmEnabled)
     {
+        stats.timeouts++;
         printf("Timeout. Retrying...\n");
     }
 }
-    alarm(0);
-    alarmEnabled = FALSE;
+    stopAlarm();
     printf("Failed to disconnect after all attempts.\n");
+    printStatistics();
     closeSerialPort();
     return -1;
 }
 
 int llCloseRx()
 {
-    // Read from serial port until checked full frame.
-    //criar o buf onde se vai escrever o frame
+    unsigned char raw[MAX_FRAME_SIZE];
     unsigned char buf[FRAME_SIZE] = {0};
-
-    //ler o frame enviado por tx
-
-    if(readFrame(buf, 0) == 0 && buf[1] == A_CMD_TX && buf[2] == C_DISC){
-        printf("DISC received from TX.\n");
-
-
-        int bytes = sendSU(A_CMD_RX, C_DISC);
-        printf("%d bytes written to serial port\n", bytes);
-        printf("DISC sent.\n");
-
-        // Esperar pela resposta
-        if (readFrame(buf, 0) == 0)
+    int rawLen;
+ 
+    // 1. Esperar pelo DISC do Tx.
+    // Se o último RR se perdeu, o Tx ainda reenvia a última trama I: é um duplicado,
+    // por isso confirmamos outra vez com RR (sem isto, o Tx esgotava as tentativas).
+    while (1)
+    {
+        int c = readTxFrame(raw, &rawLen);
+        if (c < 0) {
+            closeSerialPort();
+            return -1;
+        }
+ 
+        if (c == C_DISC)
+            break;
+ 
+        if (c == C_I0 || c == C_I1)
         {
-            if(buf[1] == A_CMD_RX && buf[2] == C_UA){
-
+            stats.duplicates++;
+            printf("Duplicate I frame while closing. Sending RR%d.\n", rxExpected);
+            sendSU(A_CMD_TX, C_RR(rxExpected));
+        }
+        // SET: ignorar
+    }
+    printf("DISC received from TX.\n");
+ 
+    // 2. Enviar DISC (comando do Rx -> protegido por temporizador) e esperar pelo UA
+    for (int i = 0; i <= ll.nRetransmissions; i++)
+    {
+        if (i > 0) stats.retransmissions++;
+ 
+        sendSU(A_CMD_RX, C_DISC);
+        printf("DISC sent. Attempt %d\n", i + 1);
+ 
+        alarmEnabled = TRUE;
+        alarm(ll.timeout);
+ 
+        while (1)
+        {
+            if (readFrame(buf, 1) < 0)
+            {
+                stats.timeouts++;
+                printf("Timeout waiting for UA.\n");
+                break; // reenviar DISC
+            }
+ 
+            if (buf[1] == A_CMD_RX && buf[2] == C_UA)
+            {
+                stopAlarm();
                 printf("UA received from TX.\n");
-            
+ 
+                printStatistics();
+ 
                 if (closeSerialPort() < 0) {
-        
                     perror("closeSerialPort");
-
                     return -1;
                 }
-
                 return 0;
             }
-            printf("Received frame is not UA.\n");
+ 
+            if (buf[1] == A_CMD_TX && buf[2] == C_DISC)
+            {
+                // O Tx não recebeu o nosso DISC e reenviou o dele: reenviar já
+                stopAlarm();
+                printf("DISC received again from TX.\n");
+                break;
             }
+        }
     }
-    printf("Failed to close connection.\n");
+ 
+    // O UA final nunca chegou (provavelmente perdeu-se e o Tx já fechou)
+    stopAlarm();
+    printf("Failed to close connection: UA not received.\n");
+    printStatistics();
     closeSerialPort();
     return -1;
 }
