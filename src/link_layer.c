@@ -554,8 +554,7 @@ int llSend(const unsigned char *buf, int bufSize)
                 stopAlarm();
                 stats.rejReceived++;
                 printf("REJ%d received.\n", txNs);
-                attempt--; // REJ não conta como tentativa
-                break;
+                break; // REJ conta como tentativa (reenvia na próxima iteração)
             }
  
         }
